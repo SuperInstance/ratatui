@@ -37,6 +37,8 @@ crossterm_0_28 = ["crossterm", "ratatui-crossterm/crossterm_0_28"]
 crossterm_0_29 = ["crossterm", "ratatui-crossterm/crossterm_0_29"]
 ## enables the [`TermionBackend`](backend::TermionBackend) backend and adds a dependency on [`termion`].
 termion = ["std", "dep:ratatui-termion"]
+## enables the [`TerminaBackend`](backend::TerminaBackend) backend and adds a dependency on [`termina`].
+termina = ["std", "dep:ratatui-termina"]
 ## enables the [`TermwizBackend`](backend::TermwizBackend) backend and adds a dependency on [`termwiz`].
 termwiz = ["std", "dep:ratatui-termwiz"]
 
@@ -52,6 +54,7 @@ serde = [
   "ratatui-widgets/serde",
   "ratatui-crossterm?/serde",
   "ratatui-termion?/serde",
+  "ratatui-termina?/serde",
   "ratatui-termwiz?/serde",
 ]
 
@@ -70,6 +73,7 @@ scrolling-regions = [
   "ratatui-core/scrolling-regions",
   "ratatui-crossterm?/scrolling-regions",
   "ratatui-termion?/scrolling-regions",
+  "ratatui-termina?/scrolling-regions",
   "ratatui-termwiz?/scrolling-regions",
 ]
 
@@ -88,11 +92,12 @@ widget-calendar = ["ratatui-widgets/calendar"]
 #! The following optional features are only available for some backends:
 
 ## Enables the backend code that sets the underline color.
-## Underline color is only supported by the Crossterm and Termwiz backends, and is not supported on
-## Windows 7.
+## Underline color is only supported by the Crossterm, Termina, and Termwiz backends, and is not
+## supported on Windows 7.
 underline-color = [
   "ratatui-core/underline-color",
   "ratatui-crossterm?/underline-color",
+  "ratatui-termina?/underline-color",
   "ratatui-termwiz?/underline-color",
 ]
 
@@ -118,6 +123,7 @@ unstable-widget-ref = []
 unstable-backend-writer = [
   "ratatui-crossterm?/unstable-backend-writer",
   "ratatui-termion?/unstable-backend-writer",
+  "ratatui-termina?/unstable-backend-writer",
 ]
 
 [dependencies]
@@ -127,6 +133,7 @@ palette = { workspace = true, optional = true }
 ratatui-core = { workspace = true }
 ratatui-crossterm = { workspace = true, optional = true }
 ratatui-macros = { workspace = true, optional = true }
+ratatui-termina = { workspace = true, optional = true }
 ratatui-termwiz = { workspace = true, optional = true }
 ratatui-widgets = { workspace = true }
 serde = { workspace = true, optional = true }
