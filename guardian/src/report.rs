@@ -52,7 +52,7 @@ impl fmt::Display for ReportFormatter<'_> {
         let history = self.profiler.history();
         if let Some(record) = history.last() {
             let mut widgets: Vec<_> = record.widget_times.iter().collect();
-            widgets.sort_by(|a, b| b.1.cmp(&a.1));
+            widgets.sort_by_key(|b| std::cmp::Reverse(b.1));
 
             for (name, time, cells) in &widgets {
                 let pct = if total.is_zero() {

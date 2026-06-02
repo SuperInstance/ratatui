@@ -245,10 +245,10 @@ mod tests {
             "StatusBar".to_string(),
             PerWidgetStats {
                 name: "StatusBar".to_string(),
-                total_time: Duration::from_millis(50),
+                total_time_us: Duration::from_millis(50).as_micros() as u64,
                 render_count: 10,
                 last_cells: 80,
-                peak_time: Duration::from_millis(10),
+                peak_time_us: Duration::from_millis(10).as_micros() as u64,
                 prev_cells: 80,
                 last_was_full_redraw: false,
                 full_redraw_allowed: false,
@@ -311,10 +311,10 @@ mod tests {
             "FullScreen".to_string(),
             PerWidgetStats {
                 name: "FullScreen".to_string(),
-                total_time: Duration::from_millis(5),
+                total_time_us: Duration::from_millis(5).as_micros() as u64,
                 render_count: 10,
                 last_cells: 2000,
-                peak_time: Duration::from_millis(1),
+                peak_time_us: Duration::from_millis(1).as_micros() as u64,
                 prev_cells: 1000,
                 last_was_full_redraw: true,
                 full_redraw_allowed: true, // whitelisted

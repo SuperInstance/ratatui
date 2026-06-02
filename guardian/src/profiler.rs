@@ -4,25 +4,30 @@
 //! and whether it's doing full redraws or incremental updates.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::budget::{BudgetViolation, FrameBudget};
 use crate::detector::WasteDetector;
+use crate::error::{GuardianError, Result};
 use crate::report::ReportFormatter;
 
 /// Statistics collected for a single widget across its lifetime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerWidgetStats {
     /// Widget name (the label you passed to `begin_widget`).
     pub name: String,
     /// Total render time accumulated across all frames.
-    pub total_time: Duration,
+    pub total_time_us: u64,
     /// Number of times this widget has been rendered.
     pub render_count: u64,
     /// Cells written in the most recent render.
     pub last_cells: usize,
-    /// Peak render time for a single call.
-    pub peak_time: Duration,
+    /// Peak render time for a single call (microseconds).
+    pub peak_time_us: u64,
     /// Cells written on the previous render (for diff tracking).
     pub prev_cells: usize,
     /// Whether the last render was a "full redraw" (cells changed significantly).
@@ -33,13 +38,38 @@ pub struct PerWidgetStats {
 }
 
 impl PerWidgetStats {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            total_time_us: 0,
+            render_count: 0,
+            last_cells: 0,
+            peak_time_us: 0,
+            prev_cells: 0,
+            last_was_full_redraw: false,
+            full_redraw_allowed: false,
+        }
+    }
+
     /// Average render time per call.
     pub fn avg_time(&self) -> Duration {
+        // Clippy: manual_checked_ops — use checked_div
+        #[allow(clippy::manual_checked_ops)]
         if self.render_count == 0 {
             Duration::ZERO
         } else {
-            self.total_time / self.render_count as u32
+            Duration::from_micros(self.total_time_us / self.render_count)
         }
+    }
+
+    /// Total time as a Duration.
+    pub fn total_time(&self) -> Duration {
+        Duration::from_micros(self.total_time_us)
+    }
+
+    /// Peak time as a Duration.
+    pub fn peak_time(&self) -> Duration {
+        Duration::from_micros(self.peak_time_us)
     }
 
     /// What fraction of total frame time this widget consumed (0.0 – 1.0).
@@ -47,19 +77,54 @@ impl PerWidgetStats {
         if total.is_zero() {
             0.0
         } else {
-            self.total_time.as_secs_f64() / total.as_secs_f64()
+            self.total_time().as_secs_f64() / total.as_secs_f64()
         }
     }
+}
+
+/// Serializable snapshot of profiler state for persistence.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfilerSnapshot {
+    pub frame_number: u64,
+    pub budget_max_render_time_us: u64,
+    pub budget_max_diff_cells: usize,
+    pub budget_max_widget_depth: usize,
+    pub widget_stats: Vec<PerWidgetStats>,
+    pub unmatched_end_widget_count: u64,
+    pub last_frame_max_depth: usize,
+    pub last_frame_time_us: Option<u64>,
+    pub last_frame_total_cells: usize,
 }
 
 /// A single completed frame's data.
 #[derive(Debug, Clone)]
 pub(crate) struct FrameRecord {
-    #[allow(dead_code)]
-    frame_number: u64,
-    total_time: Duration,
+    pub total_time: Duration,
     pub widget_times: Vec<(String, Duration, usize)>,
-    violations: Vec<BudgetViolation>,
+    pub violations: Vec<BudgetViolation>,
+}
+
+/// Trend analysis result from comparing two profiler states.
+#[derive(Debug, Clone)]
+pub struct TrendReport {
+    /// Widgets whose average render time increased.
+    pub degraded: Vec<WidgetTrend>,
+    /// Widgets whose average render time decreased.
+    pub improved: Vec<WidgetTrend>,
+    /// Widgets only present in one of the two snapshots.
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Whether any degradation exceeds the significance threshold.
+    pub significant_degradation: bool,
+}
+
+/// Trend data for a single widget across two profiler snapshots.
+#[derive(Debug, Clone)]
+pub struct WidgetTrend {
+    pub name: String,
+    pub previous_avg_us: u64,
+    pub current_avg_us: u64,
+    pub change_percent: f64,
 }
 
 /// The main profiler. Owns the budget and collects per-frame / per-widget data.
@@ -121,7 +186,6 @@ impl RenderProfiler {
             self.current_frame_max_depth = depth;
         }
         if self.budget.check_depth(depth).is_some() {
-            // Store the actual violating depth for accurate reporting
             self.depth_violation_seen = Some(depth);
         }
         self.widget_stack
@@ -131,7 +195,6 @@ impl RenderProfiler {
     /// End timing a widget. `cells_written` is the number of terminal cells this widget touched.
     pub fn end_widget(&mut self, cells_written: usize) {
         if self.widget_stack.is_empty() {
-            // Bug fix: log unmatched end_widget instead of silently dropping
             self.unmatched_end_widget_count += 1;
             return;
         }
@@ -143,18 +206,8 @@ impl RenderProfiler {
             let stats = self
                 .widget_stats
                 .entry(name.clone())
-                .or_insert_with(|| PerWidgetStats {
-                    name: name.clone(),
-                    total_time: Duration::ZERO,
-                    render_count: 0,
-                    last_cells: 0,
-                    peak_time: Duration::ZERO,
-                    prev_cells: 0,
-                    last_was_full_redraw: false,
-                    full_redraw_allowed: false,
-                });
+                .or_insert_with(|| PerWidgetStats::new(&name));
 
-            // Detect full redraw: cells changed by >50% from previous frame
             let full_redraw = if stats.render_count > 0 {
                 let diff = (cells_written as i64 - stats.last_cells as i64).unsigned_abs() as usize;
                 diff > (stats.last_cells / 2)
@@ -165,10 +218,11 @@ impl RenderProfiler {
             stats.prev_cells = stats.last_cells;
             stats.last_cells = cells_written;
             stats.last_was_full_redraw = full_redraw;
-            stats.total_time += elapsed;
+            stats.total_time_us += elapsed.as_micros() as u64;
             stats.render_count += 1;
-            if elapsed > stats.peak_time {
-                stats.peak_time = elapsed;
+            let elapsed_us = elapsed.as_micros() as u64;
+            if elapsed_us > stats.peak_time_us {
+                stats.peak_time_us = elapsed_us;
             }
         }
     }
@@ -185,13 +239,11 @@ impl RenderProfiler {
             violations.push(v);
         }
 
-        // Check diff size (sum of all widget cells as approximation)
         let total_cells: usize = self.current_frame_widgets.iter().map(|w| w.2).sum();
         if let Some(v) = self.budget.check_diff(total_cells) {
             violations.push(v);
         }
 
-        // Run waste detector
         let findings = self.detector.detect(
             self.frame_number,
             total,
@@ -202,7 +254,6 @@ impl RenderProfiler {
         );
 
         let record = FrameRecord {
-            frame_number: self.frame_number,
             total_time: total,
             widget_times: self.current_frame_widgets.clone(),
             violations,
@@ -213,7 +264,6 @@ impl RenderProfiler {
         }
         self.history.push(record);
 
-        // Stash findings for report generation
         self.detector.stash_findings(self.frame_number, findings);
 
         total
@@ -280,17 +330,7 @@ impl RenderProfiler {
         if let Some(stats) = self.widget_stats.get_mut(widget_name) {
             stats.full_redraw_allowed = allowed;
         } else {
-            // Pre-register the widget with the flag set
-            let mut stats = PerWidgetStats {
-                name: widget_name.to_string(),
-                total_time: Duration::ZERO,
-                render_count: 0,
-                last_cells: 0,
-                peak_time: Duration::ZERO,
-                prev_cells: 0,
-                last_was_full_redraw: false,
-                full_redraw_allowed: allowed,
-            };
+            let mut stats = PerWidgetStats::new(widget_name);
             stats.full_redraw_allowed = allowed;
             self.widget_stats.insert(widget_name.to_string(), stats);
         }
@@ -310,98 +350,139 @@ impl RenderProfiler {
         self.depth_violation_seen = None;
     }
 
-    /// Export profiler state as a JSON string for post-hoc analysis.
-    pub fn to_json(&self) -> String {
-        let mut json = String::from("{");
+    // ── Persistence ──────────────────────────────────────────────────
 
-        // Frame info
-        json.push_str(&format!(
-            "\"frame_number\": {},",
-            self.frame_number
-        ));
-        json.push_str(&format!(
-            "\"unmatched_end_widget_count\": {},",
-            self.unmatched_end_widget_count
-        ));
-        json.push_str(&format!(
-            "\"last_frame_max_depth\": {},",
-            self.current_frame_max_depth
-        ));
+    /// Save profiler state to a JSON file.
+    pub fn save_json(&self, path: impl AsRef<Path>) -> Result<()> {
+        let snapshot = self.to_snapshot();
+        let json = serde_json::to_string_pretty(&snapshot).map_err(|e| GuardianError::Json {
+            context: "serialize profiler snapshot".into(),
+            source: e,
+        })?;
+        fs::write(path.as_ref(), json).map_err(|e| GuardianError::Io {
+            path: path.as_ref().to_path_buf(),
+            source: e,
+        })?;
+        Ok(())
+    }
 
-        // Last frame time
-        let last_time_us = self
-            .last_frame_time()
-            .map(|t| t.as_micros() as u64)
-            .unwrap_or(0);
-        json.push_str(&format!("\"last_frame_time_us\": {last_time_us},"));
+    /// Load profiler state from a JSON file. Budget is supplied by the caller.
+    pub fn load_json(path: impl AsRef<Path>, budget: FrameBudget) -> Result<Self> {
+        let data = fs::read_to_string(path.as_ref()).map_err(|e| GuardianError::Io {
+            path: path.as_ref().to_path_buf(),
+            source: e,
+        })?;
+        let snapshot: ProfilerSnapshot =
+            serde_json::from_str(&data).map_err(|e| GuardianError::Json {
+                context: "deserialize profiler snapshot".into(),
+                source: e,
+            })?;
 
-        // Widget stats array
-        json.push_str("\"widgets\": [");
-        let mut first = true;
-        let mut widget_names: Vec<_> = self.widget_stats.keys().collect();
-        widget_names.sort();
-        for name in widget_names {
-            let s = &self.widget_stats[name];
-            if !first {
-                json.push(',');
-            }
-            first = false;
-            json.push_str("{");
-            json.push_str(&format!("\"name\": {:?},", s.name));
-            json.push_str(&format!(
-                "\"total_time_us\": {},",
-                s.total_time.as_micros()
-            ));
-            json.push_str(&format!("\"render_count\": {},", s.render_count));
-            json.push_str(&format!("\"last_cells\": {},", s.last_cells));
-            json.push_str(&format!(
-                "\"peak_time_us\": {},",
-                s.peak_time.as_micros()
-            ));
-            json.push_str(&format!(
-                "\"last_was_full_redraw\": {},",
-                s.last_was_full_redraw
-            ));
-            json.push_str(&format!(
-                "\"full_redraw_allowed\": {}",
-                s.full_redraw_allowed
-            ));
-            json.push('}');
+        let mut widget_stats = HashMap::new();
+        for ws in snapshot.widget_stats {
+            widget_stats.insert(ws.name.clone(), ws);
         }
-        json.push_str("],");
 
-        // Findings
-        let findings = self.last_findings();
-        json.push_str("\"findings\": [");
-        let mut first = true;
-        for f in findings {
-            if !first {
-                json.push(',');
-            }
-            first = false;
-            json.push('{');
-            json.push_str(&format!("\"frame\": {},", f.frame));
-            json.push_str(&format!("\"severity\": {:?},", f.severity));
-            json.push_str(&format!("\"category\": {:?}", f.category));
-            json.push('}');
+        Ok(Self {
+            budget,
+            frame_number: snapshot.frame_number,
+            frame_start: None,
+            widget_stack: Vec::new(),
+            current_frame_widgets: Vec::new(),
+            widget_stats,
+            history: Vec::new(),
+            detector: WasteDetector::new(),
+            max_history: 120,
+            unmatched_end_widget_count: snapshot.unmatched_end_widget_count,
+            current_frame_max_depth: snapshot.last_frame_max_depth,
+            depth_violation_seen: None,
+        })
+    }
+
+    fn to_snapshot(&self) -> ProfilerSnapshot {
+        ProfilerSnapshot {
+            frame_number: self.frame_number,
+            budget_max_render_time_us: self.budget.max_render_time.as_micros() as u64,
+            budget_max_diff_cells: self.budget.max_diff_cells,
+            budget_max_widget_depth: self.budget.max_widget_depth,
+            widget_stats: self.widget_stats.values().cloned().collect(),
+            unmatched_end_widget_count: self.unmatched_end_widget_count,
+            last_frame_max_depth: self.current_frame_max_depth,
+            last_frame_time_us: self.last_frame_time().map(|t| t.as_micros() as u64),
+            last_frame_total_cells: self.last_frame_total_cells(),
         }
-        json.push_str("],");
+    }
 
-        // Violations
-        json.push_str("\"violations\": [");
-        let violations = self.last_violations();
-        let mut first = true;
-        for v in violations {
-            if !first {
-                json.push(',');
+    // ── Trend analysis ───────────────────────────────────────────────
+
+    /// Compare this profiler's state against a previous one to detect trends.
+    ///
+    /// `significance_threshold` is the percentage change (e.g. `0.25` means 25%)
+    /// above which degradation is flagged as significant.
+    pub fn compare(&self, previous: &RenderProfiler, significance_threshold: f64) -> Result<TrendReport> {
+        let mut degraded = Vec::new();
+        let mut improved = Vec::new();
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+
+        // Check for widgets in current but not previous
+        for name in self.widget_stats.keys() {
+            if !previous.widget_stats.contains_key(name) {
+                added.push(name.clone());
             }
-            first = false;
-            json.push_str(&format!("{:?}", v));
         }
-        json.push_str("]");
 
-        json.push('}');
-        json
+        // Check for widgets in previous but not current
+        for name in previous.widget_stats.keys() {
+            if !self.widget_stats.contains_key(name) {
+                removed.push(name.clone());
+            }
+        }
+
+        // Compare shared widgets
+        for (name, current_stats) in &self.widget_stats {
+            if let Some(prev_stats) = previous.widget_stats.get(name) {
+                if current_stats.render_count == 0 || prev_stats.render_count == 0 {
+                    continue;
+                }
+                let current_avg = current_stats.total_time_us / current_stats.render_count;
+                let prev_avg = prev_stats.total_time_us / prev_stats.render_count;
+
+                if prev_avg == 0 {
+                    continue;
+                }
+
+                let change = (current_avg as f64 - prev_avg as f64) / prev_avg as f64 * 100.0;
+                let trend = WidgetTrend {
+                    name: name.clone(),
+                    previous_avg_us: prev_avg,
+                    current_avg_us: current_avg,
+                    change_percent: change,
+                };
+
+                if current_avg > prev_avg {
+                    degraded.push(trend);
+                } else if current_avg < prev_avg {
+                    improved.push(trend);
+                }
+            }
+        }
+
+        let significant_degradation = degraded
+            .iter()
+            .any(|t| t.change_percent.abs() > significance_threshold * 100.0);
+
+        // Sort by magnitude
+        degraded.sort_by(|a, b| b.change_percent.partial_cmp(&a.change_percent).unwrap_or(std::cmp::Ordering::Equal));
+        improved.sort_by(|a, b| a.change_percent.partial_cmp(&b.change_percent).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(TrendReport {
+            degraded,
+            improved,
+            added,
+            removed,
+            significant_degradation,
+        })
     }
 }
 
@@ -450,13 +531,11 @@ mod tests {
     fn full_redraw_detection() {
         let mut p = RenderProfiler::new(FrameBudget::for_60fps());
 
-        // Frame 1: widget writes 100 cells
         p.begin_frame();
         p.begin_widget("Status");
         p.end_widget(100);
         p.end_frame();
 
-        // Frame 2: same widget writes 200 cells (100% change → full redraw)
         p.begin_frame();
         p.begin_widget("Status");
         p.end_widget(200);
@@ -466,22 +545,18 @@ mod tests {
         assert!(stats.last_was_full_redraw);
     }
 
-    // --- Bug fix tests ---
-
     #[test]
     fn unmatched_end_widget_is_counted() {
-        // Bug #2: unmatched end_widget should increment counter, not silently drop
         let mut p = RenderProfiler::new(FrameBudget::for_60fps());
         p.begin_frame();
-        p.end_widget(100); // no matching begin_widget
+        p.end_widget(100);
         assert_eq!(p.unmatched_end_widget_count(), 1);
-        p.end_widget(50); // another unmatched
+        p.end_widget(50);
         assert_eq!(p.unmatched_end_widget_count(), 2);
     }
 
     #[test]
     fn reset_clears_all_state() {
-        // Bug #7: reset() should clear all accumulated state
         let mut p = RenderProfiler::new(FrameBudget::for_60fps());
 
         p.begin_frame();
@@ -500,30 +575,78 @@ mod tests {
     }
 
     #[test]
-    fn to_json_produces_valid_structure() {
-        // Bug #8: to_json should export profiler state
-        let mut p = RenderProfiler::new(FrameBudget::for_60fps());
+    fn save_and_load_json_roundtrip() {
+        let dir = std::env::temp_dir().join("guardian_test_save_load");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("profiler.json");
 
+        let mut p = RenderProfiler::new(FrameBudget::for_60fps());
         p.begin_frame();
         p.begin_widget("Header");
         p.end_widget(200);
         p.end_frame();
 
-        let json = p.to_json();
-        assert!(json.starts_with('{'));
-        assert!(json.contains("\"frame_number\": 1"));
-        assert!(json.contains("\"Header\""));
-        assert!(json.contains("\"widgets\":"));
-        assert!(json.contains("\"findings\":"));
-        assert!(json.contains("\"violations\":"));
+        p.save_json(&path).unwrap();
+
+        let loaded = RenderProfiler::load_json(&path, FrameBudget::for_60fps()).unwrap();
+        assert_eq!(loaded.last_frame(), 1);
+        assert_eq!(loaded.widget_stats().len(), 1);
+        assert_eq!(
+            loaded.widget_stats().get("Header").unwrap().last_cells,
+            200
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compare_detects_degradation() {
+        let budget = FrameBudget::for_60fps();
+
+        let mut prev = RenderProfiler::new(budget.clone());
+        prev.begin_frame();
+        prev.begin_widget("Widget");
+        thread::sleep(Duration::from_micros(100));
+        prev.end_widget(50);
+        prev.end_frame();
+
+        let mut curr = RenderProfiler::new(budget.clone());
+        curr.begin_frame();
+        curr.begin_widget("Widget");
+        thread::sleep(Duration::from_millis(5));
+        curr.end_widget(50);
+        curr.end_frame();
+
+        let trend = curr.compare(&prev, 0.1).unwrap();
+        assert!(!trend.degraded.is_empty());
+        assert!(trend.significant_degradation);
+    }
+
+    #[test]
+    fn compare_detects_added_removed() {
+        let budget = FrameBudget::for_60fps();
+
+        let mut prev = RenderProfiler::new(budget.clone());
+        prev.begin_frame();
+        prev.begin_widget("A");
+        prev.end_widget(10);
+        prev.end_frame();
+
+        let mut curr = RenderProfiler::new(budget.clone());
+        curr.begin_frame();
+        curr.begin_widget("B");
+        curr.end_widget(10);
+        curr.end_frame();
+
+        let trend = curr.compare(&prev, 0.5).unwrap();
+        assert!(trend.added.contains(&"B".to_string()));
+        assert!(trend.removed.contains(&"A".to_string()));
     }
 
     #[test]
     fn full_redraw_allowed_can_be_set() {
-        // Bug #4: set_full_redraw_allowed should work pre- and post-registration
         let mut p = RenderProfiler::new(FrameBudget::for_60fps());
 
-        // Pre-register
         p.set_full_redraw_allowed("MyWidget", true);
         p.begin_frame();
         p.begin_widget("MyWidget");
@@ -532,20 +655,18 @@ mod tests {
 
         assert!(p.widget_stats().get("MyWidget").unwrap().full_redraw_allowed);
 
-        // Post-register update
         p.set_full_redraw_allowed("MyWidget", false);
         assert!(!p.widget_stats().get("MyWidget").unwrap().full_redraw_allowed);
     }
 
     #[test]
     fn depth_tracking_is_accurate() {
-        // Bug #3: actual depth should be tracked, not widget count
         let mut p = RenderProfiler::new(FrameBudget::for_60fps());
 
         p.begin_frame();
-        p.begin_widget("A"); // depth 1
-        p.begin_widget("B"); // depth 2
-        p.begin_widget("C"); // depth 3
+        p.begin_widget("A");
+        p.begin_widget("B");
+        p.begin_widget("C");
         p.end_widget(10);
         p.end_widget(10);
         p.end_widget(10);

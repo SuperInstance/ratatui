@@ -1,36 +1,12 @@
-# Render Budget Guardian
+# ratatui-guardian
 
-A Rust module for [ratatui](https://github.com/ratatui/ratatui) that tracks terminal rendering performance and enforces frame budgets.
+> Render Budget Guardian — frame budget tracking and waste detection for ratatui TUI apps.
 
-## Why
+[![CI](https://github.com/SuperInstance/ratatui/actions/workflows/ci.yml/badge.svg?branch=guardian)](https://github.com/SuperInstance/ratatui/actions/workflows/ci.yml)
 
-TUI apps have a performance problem nobody talks about. Your status bar redraws 80 cells on every tick. Your layout is nested 6 deep. One widget allocates a `String` every frame just to format a number.
+Most TUI apps silently waste render time: full-screen redraws for a 2-cell change, widgets that allocate `String` on every frame, layouts nested 5+ deep. **Guardian makes that waste visible.**
 
-None of this shows up in a profiler until the app stutters. Guardian makes it visible before that.
-
-## What it does
-
-**Frame budget enforcement.** You say "16ms per frame" (60fps). Guardian tells you when you blow it.
-
-**Per-widget profiling.** How long did each widget take? How many cells did it touch? What fraction of the frame did it eat?
-
-**Waste detection.** Three anti-patterns, caught automatically:
-
-- **Full redraws for small changes.** A widget writes 2,000 cells when 2 changed. It does this every frame.
-- **Deep nesting.** Layouts nested 5+ levels. Each level is a function call, an allocation, and a layout pass.
-- **Per-frame allocation.** Widgets that take 50µs+ per cell — the signature of `String::new()` or `Vec::new()` in a hot loop.
-
-**Terminal-friendly reports.** Because you're building a TUI. The output should look good in one.
-
-```
-Frame 847: 12.0ms total (⚠ OVER BUDGET, budget: 16ms) 2080 cells
-  StatusBar: 8.0ms (67%) for 80 cells — HOG
-  Body: 3.0ms (25%) for 2000 cells
-  1 findings: 0 critical, 1 warnings, 0 hints
-    [warning] StatusBar consumed 67% of frame time
-```
-
-## Usage
+## Quick Start
 
 ```rust
 use ratatui_guardian::{FrameBudget, RenderProfiler};
@@ -38,78 +14,133 @@ use ratatui_guardian::{FrameBudget, RenderProfiler};
 let budget = FrameBudget::for_60fps();
 let mut profiler = RenderProfiler::new(budget);
 
-// In your render loop:
-loop {
-    profiler.begin_frame();
+profiler.begin_frame();
+profiler.begin_widget("StatusBar");
+// ... your widget renders ...
+profiler.end_widget(80); // cells written
+profiler.end_frame();
 
-    profiler.begin_widget("StatusBar");
-    // draw your status bar
-    profiler.end_widget(80);
-
-    profiler.begin_widget("Body");
-    // draw your body
-    profiler.end_widget(2000);
-
-    let total = profiler.end_frame();
-
-    if total > budget.max_render_time {
-        println!("{}", profiler.report());
-    }
-}
+println!("{}", profiler.report());
 ```
 
-## API
+## Features
 
-| Type | Purpose |
-|------|---------|
-| `FrameBudget` | Configure limits: render time, diff size, max depth |
-| `RenderProfiler` | Collect timing data per frame and per widget |
-| `WasteDetector` | Identify anti-patterns (usually called via profiler) |
-| `ReportFormatter` | Human-readable output via `profiler.report()` |
+| Feature | Description |
+|---------|-------------|
+| **Frame budget tracking** | Detect frames that exceed time, cell, or depth limits |
+| **Waste detection** | Identify hogs, full-redraw waste, suspected allocations, deep nesting |
+| **Automatic cell tracking** | `GuardianBuffer` adapter intercepts cell writes |
+| **Persistence** | Save/load profiler state as JSON for historical analysis |
+| **Multi-format export** | JSON, Prometheus, CSV for dashboards and monitoring |
+| **Trend analysis** | Compare two profiler snapshots to detect degradation |
 
-### FrameBudget
+## API Reference
+
+### `FrameBudget`
+
+Defines performance constraints for a render frame.
 
 ```rust
 // Presets
-let fast = FrameBudget::for_60fps();   // 16ms, 10K cells, depth 5
-let chill = FrameBudget::for_30fps();   // 33ms, 10K cells, depth 5
+let budget = FrameBudget::for_60fps();  // 16ms per frame
+let budget = FrameBudget::for_30fps();  // 33ms per frame
 
 // Custom
-let custom = FrameBudget::new(
+let budget = FrameBudget::new(
     Duration::from_millis(20),  // max render time
-    5_000,                       // max diff cells
-    3,                           // max widget depth
+    5000,                        // max diff cells
+    4,                           // max widget depth
 );
 ```
 
-### BudgetViolations
+### `RenderProfiler`
 
-The profiler checks three things at `end_frame()`:
+The core profiler. Wraps your render loop to track per-widget timing and cells.
 
-- **OverTime** — frame exceeded the time budget
-- **DiffTooLarge** — total cells written exceeded the diff budget
-- **DepthTooDeep** — widget nesting exceeded the depth limit
+| Method | Description |
+|--------|-------------|
+| `new(budget)` | Create a profiler with the given budget |
+| `begin_frame()` | Start timing a new frame |
+| `begin_widget(name)` | Start timing a widget |
+| `end_widget(cells)` | End timing, report cells written |
+| `end_frame()` | End frame, run waste detection |
+| `report()` | Get human-readable `ReportFormatter` |
+| `save_json(path)` | Persist state to JSON file |
+| `load_json(path, budget)` | Restore state from JSON file |
+| `compare(other, threshold)` | Trend analysis against another profiler |
+| `reset()` | Clear all accumulated state |
 
-### WasteCategories
+### `GuardianBuffer` / `GuardianFrame`
 
-- **Hog** — widget takes >60% of frame time (>85% = critical)
-- **FullRedrawForSmallChange** — widget rewrites everything when only a few cells changed
-- **SuspectedAllocation** — render time per cell suggests per-frame allocations
+Automatic cell tracking without manual counting:
 
-## Running tests
+```rust
+use ratatui_guardian::ratatui_adapter::GuardianFrame;
 
-```bash
-cd guardian
-cargo test
+let mut frame = GuardianFrame::begin();
+let mut buf = frame.track_widget("Header");
+// Your widget calls buf.set_cell() or buf.set_string(len)
+frame.finish_widget(buf);
+let report = frame.end();
 ```
 
-## Design notes
+### `Reporter`
 
-Guardian is intentionally standalone. It doesn't depend on ratatui itself — it just needs widget names, timing, and cell counts. You can adopt it incrementally: wrap your biggest widgets first, add more as needed.
+Multi-format export:
 
-The profiler keeps a 120-frame rolling history. Enough to spot patterns, not enough to eat memory.
+```rust
+use ratatui_guardian::Reporter;
 
-Waste detection uses heuristics, not hard thresholds. A widget that takes 50µs per cell once is fine. A widget that does it every frame for 3+ frames gets flagged. The goal is signal, not noise.
+let reporter = Reporter::from_profiler(&profiler);
+println!("{}", reporter.to_json());       // Structured JSON
+println!("{}", reporter.to_prometheus()); // Prometheus exposition format
+println!("{}", reporter.to_csv());        // CSV for spreadsheets
+```
+
+### `GuardianError`
+
+All fallible operations return `Result<T, GuardianError>`:
+
+- `Io` — file read/write errors
+- `Json` — serialization/deserialization errors
+- `NoData` — operation requires data that doesn't exist
+- `InvalidConfig` — bad parameters
+- `ComparisonFailed` — incompatible profiler states
+
+### `TrendReport`
+
+Result of comparing two profiler states:
+
+```rust
+let trend = current.compare(&baseline, 0.25)?;
+for d in &trend.degraded {
+    println!("↗ {}: +{:.1}%", d.name, d.change_percent);
+}
+if trend.significant_degradation {
+    eprintln!("Performance regression detected!");
+}
+```
+
+## Waste Detection Heuristics
+
+| Finding | Severity | Trigger |
+|---------|----------|---------|
+| **Hog** | Warning/Critical | Widget consumes >60% of frame time |
+| **Full Redraw** | Hint/Warning | Widget redraws all cells when few changed |
+| **Suspected Allocation** | Hint/Warning | Render time suggests per-frame allocations |
+| **Deep Nesting** | Hint | Layout nesting exceeds depth limit |
+
+All thresholds are configurable via `DetectionConfig`.
+
+## Examples
+
+```bash
+# Minimal — 10-line instrumentation
+cargo run --example minimal
+
+# Full demo — all features
+cargo run --example full_demo
+```
 
 ## License
 

@@ -1,12 +1,17 @@
 [package]
 name = "ratatui-guardian"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Render Budget Guardian — frame budget tracking and waste detection for ratatui TUI apps"
 license = "MIT"
+repository = "https://github.com/SuperInstance/ratatui"
+keywords = ["ratatui", "tui", "profiling", "performance", "render"]
+categories = ["development-tools::profiling", "gui"]
 
 [dependencies]
-
-[workspace]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
+
+[workspace]
