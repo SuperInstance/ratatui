@@ -32,7 +32,7 @@ mod detector;
 mod profiler;
 mod report;
 
-pub use budget::{BudgetViolation, FrameBudget};
+pub use budget::{BudgetViolation, DetectionConfig, FrameBudget};
 pub use detector::{WasteCategory, WasteDetector, WasteFinding};
 pub use profiler::{PerWidgetStats, RenderProfiler};
 pub use report::ReportFormatter;

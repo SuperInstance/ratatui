@@ -6,6 +6,53 @@
 use std::fmt;
 use std::time::Duration;
 
+/// Configurable thresholds for waste detection heuristics.
+/// Attach to a `FrameBudget` to tune detection sensitivity.
+#[derive(Debug, Clone)]
+pub struct DetectionConfig {
+    /// Fraction of frame time that qualifies a widget as a hog (0.0–1.0).
+    pub hog_fraction: f64,
+    /// Cell count above which a full-redraw heuristic triggers.
+    pub full_redraw_cell_threshold: usize,
+    /// Microseconds per cell above which we suspect per-frame allocation.
+    pub allocation_us_per_cell: u64,
+    /// Multiplier on `max_widget_depth` used by the cross-check heuristic.
+    pub deep_nesting_multiplier: usize,
+}
+
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            hog_fraction: 0.6,
+            full_redraw_cell_threshold: 500,
+            allocation_us_per_cell: 50,
+            deep_nesting_multiplier: 2,
+        }
+    }
+}
+
+impl DetectionConfig {
+    /// Detection config with the original default thresholds.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Detection config with custom thresholds.
+    pub fn with(
+        hog_fraction: f64,
+        full_redraw_cell_threshold: usize,
+        allocation_us_per_cell: u64,
+        deep_nesting_multiplier: usize,
+    ) -> Self {
+        Self {
+            hog_fraction,
+            full_redraw_cell_threshold,
+            allocation_us_per_cell,
+            deep_nesting_multiplier,
+        }
+    }
+}
+
 /// Hard limits for a single render frame.
 ///
 /// Create one via [`FrameBudget::for_60fps`] or [`FrameBudget::for_30fps`],
@@ -18,6 +65,8 @@ pub struct FrameBudget {
     pub max_diff_cells: usize,
     /// Maximum widget nesting depth before we flag it.
     pub max_widget_depth: usize,
+    /// Configurable detection thresholds.
+    pub detection: DetectionConfig,
 }
 
 impl FrameBudget {
@@ -27,6 +76,7 @@ impl FrameBudget {
             max_render_time: Duration::from_millis(16),
             max_diff_cells: 10_000, // ~130×75 terminal, conservative
             max_widget_depth: 5,
+            detection: DetectionConfig::default(),
         }
     }
 
@@ -36,15 +86,32 @@ impl FrameBudget {
             max_render_time: Duration::from_millis(33),
             max_diff_cells: 10_000,
             max_widget_depth: 5,
+            detection: DetectionConfig::default(),
         }
     }
 
-    /// Budget with custom limits.
+    /// Budget with custom limits (uses default detection config).
     pub fn new(max_render_time: Duration, max_diff_cells: usize, max_widget_depth: usize) -> Self {
         Self {
             max_render_time,
             max_diff_cells,
             max_widget_depth,
+            detection: DetectionConfig::default(),
+        }
+    }
+
+    /// Budget with custom limits and custom detection config.
+    pub fn with_detection(
+        max_render_time: Duration,
+        max_diff_cells: usize,
+        max_widget_depth: usize,
+        detection: DetectionConfig,
+    ) -> Self {
+        Self {
+            max_render_time,
+            max_diff_cells,
+            max_widget_depth,
+            detection,
         }
     }
 

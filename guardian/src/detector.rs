@@ -121,15 +121,17 @@ impl WasteDetector {
         widgets: &[(String, Duration, usize)],
         all_stats: &HashMap<String, PerWidgetStats>,
         budget: &FrameBudget,
+        actual_max_depth: usize,
     ) -> Vec<WasteFinding> {
         let mut findings = Vec::new();
-        let _total_cells: usize = widgets.iter().map(|w| w.2).sum();
+        let cfg = &budget.detection;
 
         for (name, time, cells) in widgets {
-            // Check for hog: widget takes >60% of frame time
-            if !frame_time.is_zero() {
+            // Check for hog: widget takes >configured fraction of frame time
+            // Bug fix: use > 1µs guard for floating-point safety instead of is_zero()
+            if frame_time > Duration::from_micros(1) {
                 let fraction = time.as_secs_f64() / frame_time.as_secs_f64();
-                if fraction > 0.6 {
+                if fraction > cfg.hog_fraction {
                     findings.push(WasteFinding {
                         frame,
                         category: WasteCategory::Hog {
@@ -146,10 +148,13 @@ impl WasteDetector {
             }
 
             // Check for full-redraw-for-small-change
+            // Bug fix: skip if widget has full_redraw_allowed set
             if let Some(stats) = all_stats.get(name) {
-                if stats.render_count > 3 && stats.last_was_full_redraw && *cells > 500 {
-                    // Heuristic: if the widget consistently does full redraws
-                    // and writes many cells, flag it
+                if !stats.full_redraw_allowed
+                    && stats.render_count > 3
+                    && stats.last_was_full_redraw
+                    && *cells > cfg.full_redraw_cell_threshold
+                {
                     let estimated = (*cells / 10).max(2);
                     findings.push(WasteFinding {
                         frame,
@@ -167,11 +172,11 @@ impl WasteDetector {
                 }
             }
 
-            // Check for suspected allocation: >50µs per cell is suspicious
+            // Check for suspected allocation: uses configurable threshold
             let time_us = time.as_micros() as u64;
             if *cells > 0 && time_us > 0 {
                 let us_per_cell = time_us / (*cells as u64).max(1);
-                if us_per_cell > 50 {
+                if us_per_cell > cfg.allocation_us_per_cell {
                     findings.push(WasteFinding {
                         frame,
                         category: WasteCategory::SuspectedAllocation {
@@ -179,7 +184,7 @@ impl WasteDetector {
                             render_time_us: time_us,
                             cells: *cells,
                         },
-                        severity: if us_per_cell > 200 {
+                        severity: if us_per_cell > cfg.allocation_us_per_cell * 4 {
                             Severity::Warning
                         } else {
                             Severity::Hint
@@ -189,17 +194,21 @@ impl WasteDetector {
             }
         }
 
-        // Deep nesting check (approximated by widget count in a single frame)
-        // The real depth tracking happens in begin_widget; this is a cross-check
-        if widgets.len() > budget.max_widget_depth * 2 {
-            findings.push(WasteFinding {
-                frame,
-                category: WasteCategory::DeepNesting {
-                    depth: widgets.len(),
-                    limit: budget.max_widget_depth,
-                },
-                severity: Severity::Hint,
-            });
+        // Bug fix: Deep nesting check now uses actual tracked depth, not total widget count
+        if actual_max_depth > budget.max_widget_depth * cfg.deep_nesting_multiplier
+            || actual_max_depth > budget.max_widget_depth
+        {
+            // Only emit if it's actually over the depth limit
+            if actual_max_depth > budget.max_widget_depth {
+                findings.push(WasteFinding {
+                    frame,
+                    category: WasteCategory::DeepNesting {
+                        depth: actual_max_depth,
+                        limit: budget.max_widget_depth,
+                    },
+                    severity: Severity::Hint,
+                });
+            }
         }
 
         findings
@@ -225,6 +234,7 @@ impl Default for WasteDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DetectionConfig;
 
     #[test]
     fn detects_hog() {
@@ -241,6 +251,7 @@ mod tests {
                 peak_time: Duration::from_millis(10),
                 prev_cells: 80,
                 last_was_full_redraw: false,
+                full_redraw_allowed: false,
             },
         );
 
@@ -255,6 +266,7 @@ mod tests {
             &widgets,
             &stats,
             &budget,
+            2, // actual_max_depth
         );
 
         let hogs: Vec<_> = findings
@@ -263,5 +275,175 @@ mod tests {
             .collect();
         assert!(!hogs.is_empty());
         assert!(matches!(hogs[0].severity, Severity::Critical));
+    }
+
+    // --- Bug fix tests ---
+
+    #[test]
+    fn division_by_zero_safe_with_tiny_frame_time() {
+        // Bug #1: ensure no panic when frame_time is very small but non-zero
+        let detector = WasteDetector::new();
+        let budget = FrameBudget::for_60fps();
+        let stats = HashMap::new();
+        let widgets = vec![
+            ("Widget".to_string(), Duration::from_nanos(500), 100),
+        ];
+        // frame_time of 0.5µs — should NOT panic
+        let findings = detector.detect(
+            1,
+            Duration::from_nanos(500),
+            &widgets,
+            &stats,
+            &budget,
+            1,
+        );
+        // Should not trigger hog since frame_time is too small for reliable ratio
+        assert!(findings.is_empty() || findings.iter().all(|f| !matches!(f.category, WasteCategory::Hog { .. })));
+    }
+
+    #[test]
+    fn full_redraw_allowed_suppresses_heuristic() {
+        // Bug #4: widget with full_redraw_allowed=true should not be flagged
+        let detector = WasteDetector::new();
+        let budget = FrameBudget::for_60fps();
+        let mut stats = HashMap::new();
+        stats.insert(
+            "FullScreen".to_string(),
+            PerWidgetStats {
+                name: "FullScreen".to_string(),
+                total_time: Duration::from_millis(5),
+                render_count: 10,
+                last_cells: 2000,
+                peak_time: Duration::from_millis(1),
+                prev_cells: 1000,
+                last_was_full_redraw: true,
+                full_redraw_allowed: true, // whitelisted
+            },
+        );
+        let widgets = vec![
+            ("FullScreen".to_string(), Duration::from_micros(500), 2000),
+        ];
+        let findings = detector.detect(
+            1,
+            Duration::from_millis(1),
+            &widgets,
+            &stats,
+            &budget,
+            1,
+        );
+        assert!(findings.iter().all(|f| !matches!(f.category, WasteCategory::FullRedrawForSmallChange { .. })));
+    }
+
+    #[test]
+    fn deep_nesting_uses_actual_depth_not_widget_count() {
+        // Bug #3: 10 flat widgets should NOT trigger deep nesting if depth is 1
+        let detector = WasteDetector::new();
+        let budget = FrameBudget::for_60fps(); // max_widget_depth = 5
+        let stats = HashMap::new();
+        let widgets: Vec<(String, Duration, usize)> = (0..10)
+            .map(|i| (format!("Widget{i}"), Duration::from_micros(100), 50))
+            .collect();
+        // actual_max_depth = 1 (all flat), even though there are 10 widgets
+        let findings = detector.detect(
+            1,
+            Duration::from_millis(1),
+            &widgets,
+            &stats,
+            &budget,
+            1, // actual depth is 1
+        );
+        assert!(findings.iter().all(|f| !matches!(f.category, WasteCategory::DeepNesting { .. })));
+    }
+
+    #[test]
+    fn deep_nesting_flags_when_actual_depth_exceeds_limit() {
+        // Bug #3: actual depth > limit should trigger
+        let detector = WasteDetector::new();
+        let budget = FrameBudget::for_60fps(); // max_widget_depth = 5
+        let stats = HashMap::new();
+        let widgets = vec![
+            ("A".to_string(), Duration::from_micros(100), 50),
+        ];
+        let findings = detector.detect(
+            1,
+            Duration::from_millis(1),
+            &widgets,
+            &stats,
+            &budget,
+            8, // actual depth is 8 > max of 5
+        );
+        let nesting: Vec<_> = findings
+            .iter()
+            .filter(|f| matches!(f.category, WasteCategory::DeepNesting { .. }))
+            .collect();
+        assert_eq!(nesting.len(), 1);
+        if let WasteCategory::DeepNesting { depth, limit } = &nesting[0].category {
+            assert_eq!(*depth, 8);
+            assert_eq!(*limit, 5);
+        }
+    }
+
+    #[test]
+    fn configurable_hog_fraction() {
+        // Bug #5/#6: custom hog_fraction should be respected
+        let detector = WasteDetector::new();
+        let detection = DetectionConfig::with(
+            0.9,  // hog_fraction = 90%
+            500,
+            50,
+            2,
+        );
+        let budget = FrameBudget::with_detection(
+            Duration::from_millis(16),
+            10_000,
+            5,
+            detection,
+        );
+        let stats = HashMap::new();
+        let widgets = vec![
+            ("Widget".to_string(), Duration::from_millis(12), 100),
+        ];
+        // 12/14 ≈ 85.7%, below the 90% threshold
+        let findings = detector.detect(
+            1,
+            Duration::from_millis(14),
+            &widgets,
+            &stats,
+            &budget,
+            1,
+        );
+        assert!(findings.iter().all(|f| !matches!(f.category, WasteCategory::Hog { .. })));
+    }
+
+    #[test]
+    fn configurable_allocation_threshold() {
+        // Bug #5/#6: custom allocation_us_per_cell should be respected
+        let detector = WasteDetector::new();
+        let detection = DetectionConfig::with(
+            0.6,
+            500,
+            200, // threshold = 200µs/cell (higher than default 50)
+            2,
+        );
+        let budget = FrameBudget::with_detection(
+            Duration::from_millis(16),
+            10_000,
+            5,
+            detection,
+        );
+        let stats = HashMap::new();
+        // 100µs for 1 cell = 100µs/cell — should NOT trigger at 200 threshold
+        let widgets = vec![
+            ("Widget".to_string(), Duration::from_micros(100), 1),
+        ];
+        let findings = detector.detect(
+            1,
+            Duration::from_millis(1),
+            &widgets,
+            &stats,
+            &budget,
+            1,
+        );
+        assert!(findings.iter().all(|f| !matches!(f.category, WasteCategory::SuspectedAllocation { .. })));
     }
 }
