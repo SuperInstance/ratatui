@@ -1,0 +1,10 @@
+[package]
+name = "agent-dashboard"
+publish = false
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+crossterm.workspace = true
